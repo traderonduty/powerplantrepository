@@ -2895,6 +2895,7 @@ async function connectDb() {
     saveDbConfig();
     setDbMsg('Connected. Press Build with nothing uploaded to load the stored data. To update the sheet, upload files and press Save to sheet.', 'ok');
     renderFileList();
+    autoBuildFromDb();
   } catch (e) {
     dbConfig = null; dbStatus = null;
     setDbMsg(e.message, 'error');
@@ -3013,6 +3014,18 @@ async function loadFromDatabase(day) {
   return true;
 }
 
+// When the database already holds data, load the latest day and build straight away
+// (runs on page open and right after a first connect, never over files already added)
+async function autoBuildFromDb() {
+  if (!dbConfig || !dbStatus || loadedFiles.length || masterRows.length) return;
+  if (!dbStatus.capeg.days.length && !dbStatus.caper.days.length) return;
+  try {
+    if (await loadFromDatabase('latest')) buildRepository();
+  } catch (e) {
+    setDbMsg('Could not load: ' + e.message, 'error');
+  }
+}
+
 async function onBuildClick() {
   clearError();
   const hasUpload = loadedFiles.some(f => !f.fromDatabase && (f.type === 'capeg' || f.type === 'caper'));
@@ -3050,7 +3063,10 @@ function initDb() {
   renderDbPanel();
   if (dbConfig) {
     renderFileList();
-    refreshDbStatus().catch(e => setDbMsg('Could not reach the database: ' + e.message, 'error'));
+    refreshDbStatus().then(
+      () => autoBuildFromDb(),
+      e => setDbMsg('Could not reach the database: ' + e.message, 'error')
+    );
   }
 }
 

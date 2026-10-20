@@ -368,6 +368,18 @@
   .empty-note { color: var(--ink-soft); font-size: 13px; text-align: center; padding: 24px 0; }
   .footnote { font-size: 12px; color: var(--ink-soft); margin-top: 8px; }
   .error-msg { color: var(--danger); font-size: 13px; margin-top: 12px; }
+  .ok-msg { color: var(--mindanao); font-size: 13px; margin-top: 12px; }
+  .info-msg { color: var(--ink-soft); font-size: 13px; margin-top: 12px; }
+  .db-fields { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-top: 14px; align-items: center; }
+  .db-fields input[type=text], .db-fields input[type=password], .db-bar select {
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13.5px;
+    font-family: inherit; background: #fff; color: var(--ink); min-width: 0;
+  }
+  .db-bar { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; margin-top: 14px; font-size: 13.5px; }
+  .db-pill { background: var(--blueprint-dim); color: var(--blueprint); border-radius: 999px; padding: 4px 12px; font-size: 12.5px; font-weight: 500; }
+  .db-bar label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .db-bar button.ghost { padding: 8px 14px; font-size: 13px; }
+  @media (max-width: 700px) { .db-fields { grid-template-columns: 1fr; } }
   .hidden { display: none; }
 </style>
 </head>
@@ -385,6 +397,28 @@
   </div>
 
   <div id="tabBuilder">
+  <div class="panel" id="dbPanel">
+    <h2>Database (optional)</h2>
+    <p class="desc">Connect your Google Sheet once, then press Build with nothing uploaded and the tool loads the stored CAPEG and CAPER data from it. To update the sheet, upload new files and press Save to sheet. Setup steps are at the top of Code.gs.</p>
+    <div id="dbDisconnected">
+      <div class="db-fields">
+        <input type="text" id="dbUrl" placeholder="Web app URL (ends in /exec)" autocomplete="off" />
+        <button class="primary" id="dbConnectBtn">Connect</button>
+      </div>
+    </div>
+    <div id="dbConnected" class="hidden">
+      <div class="db-bar">
+        <span class="db-pill" id="dbPill">Connected</span>
+        <label>Load day <select id="dbDaySel"><option value="latest">Latest</option></select></label>
+        <label><input type="checkbox" id="dbAutoSave" /> Also save uploaded files on Build</label>
+        <button class="ghost" id="dbSaveBtn">Save to sheet</button>
+        <button class="ghost" id="dbRefreshBtn">Refresh</button>
+        <button class="ghost" id="dbDisconnectBtn">Disconnect</button>
+      </div>
+    </div>
+    <div id="dbMsg" class="info-msg hidden"></div>
+  </div>
+
   <div class="panel">
     <h2>1. Add files</h2>
     <p class="desc">Any number of CAPEG and CAPER files, in .csv or .xlsx. Type is auto-detected from each file's columns, not its name or extension &mdash; and a multi-tab .xlsx gets every sheet checked individually.</p>
@@ -2648,7 +2682,15 @@ function handleFiles(fileArray) {
     return;
   }
   let pending = files.length;
-  const done = () => { pending -= 1; if (pending === 0) renderFileList(); };
+  const done = () => {
+    pending -= 1;
+    if (pending === 0) {
+      // freshly uploaded files of a type replace any copy loaded from the database
+      const uploadedTypes = new Set(loadedFiles.filter(f => !f.fromDatabase).map(f => f.type));
+      loadedFiles = loadedFiles.filter(f => !f.fromDatabase || !uploadedTypes.has(f.type));
+      renderFileList();
+    }
+  };
 
   files.forEach(file => {
     const isXlsx = file.name.toLowerCase().endsWith('.xlsx');
@@ -2722,7 +2764,7 @@ function renderFileList() {
   });
 
   const hasKnown = loadedFiles.some(f => f.type !== 'unknown');
-  optionsPanel.style.display = loadedFiles.length ? 'block' : 'none';
+  optionsPanel.style.display = (loadedFiles.length || (typeof dbConfig !== 'undefined' && dbConfig)) ? 'block' : 'none';
   if (loadedFiles.length === 0) {
     resultsEl.style.display = 'none';
   }
@@ -2747,7 +2789,273 @@ document.getElementById('clearBtn').addEventListener('click', () => {
   resultsEl.style.display = 'none';
 });
 
-document.getElementById('processBtn').addEventListener('click', buildRepository);
+// ---------------------------------------------------------------------------
+// Database (Google Sheets backend via Apps Script web app)
+// ---------------------------------------------------------------------------
+const DB_STORE_KEY = 'powerplantRepoDb';
+const DB_BATCH_ROWS = 8000;
+const DB_COLS = {
+  capeg: ['TRADING_DAY_ID', 'TP_NAME', 'RESOURCE_NAME', 'MAXIMUM_CAPACITY'],
+  caper: ['TRADING_DAY_ID', 'TP_NAME', 'RESOURCE_NAME', 'PRODUCT_TYPE', 'MAX_CAPACITY']
+};
+// Optional: paste your Web app URL between the quotes to connect automatically in every browser.
+const DEFAULT_DB_URL = '';
+let dbConfig = null;   // { url, autoSave }
+let dbStatus = null;   // { capeg:{days,rowCount}, caper:{days,rowCount} }
+let dbSaving = false;
+
+function fmtDay(d) {
+  d = String(d || '');
+  return /^\d{8}$/.test(d) ? `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}` : d;
+}
+
+function setDbMsg(text, kind) {
+  const el = document.getElementById('dbMsg');
+  if (!text) { el.classList.add('hidden'); el.textContent = ''; return; }
+  el.className = (kind === 'error' ? 'error-msg' : kind === 'ok' ? 'ok-msg' : 'info-msg');
+  el.textContent = text;
+}
+
+function saveDbConfig() {
+  try {
+    if (dbConfig) localStorage.setItem(DB_STORE_KEY, JSON.stringify(dbConfig));
+    else localStorage.removeItem(DB_STORE_KEY);
+  } catch (e) { /* storage unavailable: connection lasts for this visit only */ }
+}
+
+async function dbRequest(payload) {
+  if (!dbConfig) throw new Error('Not connected to a database.');
+  let res;
+  try {
+    res = await fetch(dbConfig.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      redirect: 'follow'
+    });
+  } catch (e) {
+    throw new Error('Could not reach the web app. Check the URL and your internet connection.');
+  }
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); }
+  catch (e) {
+    throw new Error('The URL did not return data. Make sure it is the /exec Web app URL and that "Who has access" is set to Anyone.');
+  }
+  if (!data.ok) throw new Error(data.error || 'The database reported an error.');
+  return data;
+}
+
+function renderDbPanel() {
+  const connected = !!dbConfig;
+  document.getElementById('dbDisconnected').classList.toggle('hidden', connected);
+  document.getElementById('dbConnected').classList.toggle('hidden', !connected);
+  if (!connected) return;
+  document.getElementById('dbAutoSave').checked = dbConfig.autoSave === true;
+  const pill = document.getElementById('dbPill');
+  const sel = document.getElementById('dbDaySel');
+  const keep = sel.value;
+  sel.innerHTML = '<option value="latest">Latest</option>';
+  if (dbStatus) {
+    const days = Array.from(new Set([].concat(dbStatus.capeg.days, dbStatus.caper.days))).sort().reverse();
+    days.forEach(d => {
+      const o = document.createElement('option');
+      o.value = d; o.textContent = fmtDay(d);
+      sel.appendChild(o);
+    });
+    if (keep && Array.from(sel.options).some(o => o.value === keep)) sel.value = keep;
+    const latest = days[0];
+    pill.textContent = days.length
+      ? `Connected · ${days.length} day${days.length === 1 ? '' : 's'} stored · latest ${fmtDay(latest)}`
+      : 'Connected · empty';
+  } else {
+    pill.textContent = 'Connected';
+  }
+}
+
+async function refreshDbStatus() {
+  const data = await dbRequest({ action: 'status' });
+  dbStatus = { capeg: data.capeg, caper: data.caper };
+  renderDbPanel();
+  return dbStatus;
+}
+
+async function connectDb() {
+  const url = document.getElementById('dbUrl').value.trim();
+  if (!/^https:\/\/script\.google\.com\/.+\/exec(\?.*)?$/.test(url)) {
+    setDbMsg('That does not look like a Web app URL. It should start with https://script.google.com/ and end with /exec.', 'error');
+    return;
+  }
+  const btn = document.getElementById('dbConnectBtn');
+  btn.disabled = true;
+  setDbMsg('Connecting…');
+  dbConfig = { url, autoSave: false };
+  try {
+    await refreshDbStatus();
+    saveDbConfig();
+    setDbMsg('Connected. Press Build with nothing uploaded to load the stored data. To update the sheet, upload files and press Save to sheet.', 'ok');
+    renderFileList();
+  } catch (e) {
+    dbConfig = null; dbStatus = null;
+    setDbMsg(e.message, 'error');
+    renderDbPanel();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function disconnectDb() {
+  dbConfig = null; dbStatus = null;
+  saveDbConfig();
+  setDbMsg('');
+  renderDbPanel();
+  renderFileList();
+}
+
+function toDbRow(type, r) {
+  const o = {};
+  DB_COLS[type].forEach(c => { o[c] = r[c] == null ? '' : r[c]; });
+  return o;
+}
+
+async function uploadRowsToDb(type, rows) {
+  // whole trading days travel together in one request, because the backend replaces by day
+  const byDay = new Map();
+  rows.forEach(r => {
+    const d = String(r.TRADING_DAY_ID || '').trim();
+    if (!byDay.has(d)) byDay.set(d, []);
+    byDay.get(d).push(toDbRow(type, r));
+  });
+  const batches = [];
+  let cur = [];
+  byDay.forEach(dayRows => {
+    if (cur.length && cur.length + dayRows.length > DB_BATCH_ROWS) { batches.push(cur); cur = []; }
+    cur = cur.concat(dayRows);
+  });
+  if (cur.length) batches.push(cur);
+  const total = { written: 0, replaced: 0, skipped: 0, days: new Set() };
+  for (const batch of batches) {
+    const res = await dbRequest({ action: 'upload', type, rows: batch });
+    total.written += res.rowsWritten; total.replaced += res.rowsReplaced; total.skipped += res.rowsSkipped;
+    res.days.forEach(d => total.days.add(d));
+  }
+  return total;
+}
+
+async function saveLoadedFilesToDb() {
+  if (!dbConfig || dbSaving) return;
+  const pending = loadedFiles.filter(f => (f.type === 'capeg' || f.type === 'caper') && !f.fromDatabase && !f.saved);
+  if (!pending.length) { setDbMsg('Nothing new to save. These files are already in the database.'); return; }
+  dbSaving = true;
+  setDbMsg('Saving to the database…');
+  try {
+    const sums = { capeg: null, caper: null };
+    for (const type of ['capeg', 'caper']) {
+      const files = pending.filter(f => f.type === type);
+      if (!files.length) continue;
+      const rows = files.flatMap(f => f.rows);
+      sums[type] = await uploadRowsToDb(type, rows);
+      files.forEach(f => { f.saved = true; });
+    }
+    const parts = [];
+    ['capeg', 'caper'].forEach(t => {
+      const s = sums[t];
+      if (!s) return;
+      parts.push(`${t.toUpperCase()}: ${s.written} rows for ${Array.from(s.days).map(fmtDay).join(', ')}` +
+        (s.replaced ? ` (replaced ${s.replaced} existing)` : '') + (s.skipped ? `, ${s.skipped} skipped` : ''));
+    });
+    setDbMsg('Saved to the database. ' + parts.join(' · '), 'ok');
+    await refreshDbStatus();
+  } catch (e) {
+    setDbMsg('Could not save: ' + e.message, 'error');
+  } finally {
+    dbSaving = false;
+  }
+}
+
+function maybeAutoSaveToDb() {
+  if (!dbConfig || dbConfig.autoSave !== true) return;
+  // stay quiet when everything is already stored (e.g. a build from database data),
+  // so load messages and warnings are not overwritten
+  const hasPending = loadedFiles.some(f => (f.type === 'capeg' || f.type === 'caper') && !f.fromDatabase && !f.saved);
+  if (hasPending) saveLoadedFilesToDb();
+}
+
+async function loadFromDatabase(day) {
+  setDbMsg('Loading from the database…');
+  const data = await dbRequest({ action: 'read', day: day || 'latest' });
+  if (!data.capeg.rows.length && !data.caper.rows.length) {
+    setDbMsg(day && day !== 'latest'
+      ? `The database has no data for ${fmtDay(day)}.`
+      : 'The database is empty. Upload CAPEG and CAPER files and press Build to start saving.', 'error');
+    return false;
+  }
+  loadedFiles = loadedFiles.filter(f => !f.fromDatabase);
+  ['capeg', 'caper'].forEach(type => {
+    const part = data[type];
+    if (!part.rows.length) return;
+    const rows = part.rows.map(r => {
+      const o = {};
+      DB_COLS[type].forEach(c => { o[c] = r[c] == null ? '' : String(r[c]); });
+      return o;
+    });
+    loadedFiles.push({ name: `Database — ${type.toUpperCase()} ${fmtDay(part.day)}`, type, rows, rowCount: rows.length, fromDatabase: true, saved: true });
+  });
+  renderFileList();
+  const cd = data.capeg.day, rd = data.caper.day;
+  if (cd && rd && cd !== rd) {
+    setDbMsg(`Heads up: CAPEG is from ${fmtDay(cd)} but CAPER is from ${fmtDay(rd)}. Upload the missing day to line them up.`);
+  } else if (!cd || !rd) {
+    setDbMsg(`Loaded ${cd ? 'CAPEG' : 'CAPER'} only (${fmtDay(cd || rd)}). The database has no ${cd ? 'CAPER' : 'CAPEG'} data yet.`);
+  } else {
+    setDbMsg(`Loaded ${fmtDay(cd)} from the database.`, 'ok');
+  }
+  return true;
+}
+
+async function onBuildClick() {
+  clearError();
+  const hasUpload = loadedFiles.some(f => !f.fromDatabase && (f.type === 'capeg' || f.type === 'caper'));
+  if (dbConfig && !hasUpload) {
+    const btn = document.getElementById('processBtn');
+    btn.disabled = true;
+    try {
+      const ok = await loadFromDatabase(document.getElementById('dbDaySel').value);
+      if (!ok) return;
+    } catch (e) {
+      setDbMsg('Could not load: ' + e.message, 'error');
+      return;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  buildRepository();
+}
+
+function initDb() {
+  document.getElementById('dbConnectBtn').addEventListener('click', connectDb);
+  document.getElementById('dbDisconnectBtn').addEventListener('click', disconnectDb);
+  document.getElementById('dbSaveBtn').addEventListener('click', saveLoadedFilesToDb);
+  document.getElementById('dbRefreshBtn').addEventListener('click', async () => {
+    try { await refreshDbStatus(); setDbMsg('Refreshed.', 'ok'); } catch (e) { setDbMsg(e.message, 'error'); }
+  });
+  document.getElementById('dbAutoSave').addEventListener('change', (e) => {
+    if (dbConfig) { dbConfig.autoSave = e.target.checked; saveDbConfig(); }
+  });
+  try {
+    const raw = localStorage.getItem(DB_STORE_KEY);
+    if (raw) dbConfig = JSON.parse(raw);
+  } catch (e) { dbConfig = null; }
+  if (!dbConfig && DEFAULT_DB_URL) dbConfig = { url: DEFAULT_DB_URL, autoSave: false };
+  renderDbPanel();
+  if (dbConfig) {
+    renderFileList();
+    refreshDbStatus().catch(e => setDbMsg('Could not reach the database: ' + e.message, 'error'));
+  }
+}
+
+document.getElementById('processBtn').addEventListener('click', onBuildClick);
+initDb();
 
 function keepLatestBy(rows, keyFields, dayField) {
   const map = new Map();
@@ -2975,6 +3283,7 @@ function buildRepository() {
 
   masterRows = base;
   renderResults();
+  maybeAutoSaveToDb();
 }
 
 function renderResults() {
